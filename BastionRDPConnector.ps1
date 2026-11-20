@@ -26,6 +26,8 @@ clipboard and other redirections follow the user's default RDP settings.
 RDP policy can still require an interactive credential prompt.
 Checks do not prove that NSG rules, guest RDP configuration, or credentials
 allow sign-in. VM startup can incur cost; the VM is not stopped on disconnect.
+To build a customer EXE, set the defaults below (including $CustomerName) and run
+Build-Exe.ps1; it writes BastionRDPConnector-<Customer>.exe via PS2EXE.
 #>
 #Requires -Version 5.1
 
@@ -61,6 +63,10 @@ $AppCredits = 'Credits to BTS-Team / Christian Flock'
 $form.Text = "$AppTitle - $CustomerName"
 $form.Size = [System.Drawing.Size]::new(760, 520)
 $form.StartPosition = 'CenterScreen'
+$hostExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+if ([IO.Path]::GetFileName($hostExe) -notmatch '^(powershell|pwsh)(_ise)?\.exe$') {
+    $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($hostExe)
+}
 $form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
 $form.AutoScroll = $true
 
@@ -263,15 +269,39 @@ function Find-AzCommand {
     return $null
 }
 
+function ConvertTo-AzArgument {
+    param([string]$Value)
+    if ($Value -match '^[\w.:/=@-]+$') { return $Value }
+    '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
+
 function Invoke-AzRaw {
     param([string[]]$Arguments)
-    # Windows PowerShell maps native stderr to ErrorRecords, even for CLI warnings.
-    $ErrorActionPreference = 'Continue'
-    $output = @(& $script:AzCommand @Arguments 2>&1)
-    [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
-        Output = ($output | ForEach-Object { "$_" }) -join "`n"
+    # A hidden child process keeps the compiled no-console EXE from flashing console windows.
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = "$env:SystemRoot\System32\cmd.exe"
+    $azArguments = ($Arguments | ForEach-Object { ConvertTo-AzArgument $_ }) -join ' '
+    $startInfo.Arguments = "/d /s /c `"`"$script:AzCommand`" $azArguments`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $startInfo.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    $process = [Diagnostics.Process]::Start($startInfo)
+    try {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        while (-not $process.WaitForExit(100)) { [System.Windows.Forms.Application]::DoEvents() }
+        $process.WaitForExit()
+        $output = @($stdout.Result, $stderr.Result | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = ($output | ForEach-Object { $_.TrimEnd() }) -join "`n"
+        }
     }
+    finally { $process.Dispose() }
 }
 
 function Invoke-Az {

@@ -389,6 +389,16 @@ Describe 'Azure CLI discovery' {
         }
         finally { $env:PATH = $oldPath }
     }
+
+    It 'runs az.cmd hidden from a path with spaces and captures output, errors, and exit code' {
+        $bin = Join-Path $TestDrive 'my bin'
+        New-Item -ItemType Directory -Path $bin | Out-Null
+        $script:AzCommand = Join-Path $bin 'az.cmd'
+        Set-Content -Path $script:AzCommand -Value "@echo off`r`necho args:%*`r`necho cli warning 1>&2`r`nexit /b 3"
+        $result = Invoke-AzRaw @('vm', 'show', '--query', 'a b')
+        $result.ExitCode | Should Be 3
+        $result.Output | Should Be "args:vm show --query `"a b`"`ncli warning"
+    }
 }
 
 Describe 'Tunnel process cleanup' {
