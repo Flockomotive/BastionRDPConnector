@@ -11,14 +11,7 @@ Import-Module ps2exe
 
 $source = Join-Path $PSScriptRoot 'BastionRDPConnector.ps1'
 $icon = Join-Path $PSScriptRoot 'BastionRDPConnector.ico'
-
-# One EXE per customer: the name comes from $CustomerName in the script defaults.
-$customerMatch = Select-String -Path $source -Pattern "^\`$CustomerName\s*=\s*'([^']*)'" | Select-Object -First 1
-if (-not $customerMatch) { throw "Could not find `$CustomerName = '...' in $source." }
-$customer = $customerMatch.Matches[0].Groups[1].Value
-$safeCustomer = ($customer -replace '[^\w.-]', '_').Trim('_')
-$exeName = if ($safeCustomer) { "BastionRDPConnector-$safeCustomer.exe" } else { 'BastionRDPConnector.exe' }
-$output = Join-Path $PSScriptRoot $exeName
+$output = Join-Path $PSScriptRoot 'BastionRDPConnector.exe'
 
 if (-not (Test-Path $icon)) {
     Add-Type -AssemblyName System.Drawing
@@ -53,6 +46,6 @@ if (-not (Test-Path $icon)) {
 Invoke-PS2EXE -inputFile $source -outputFile $output -iconFile $icon `
     -noConsole -STA -x64 -DPIAware `
     -title 'BE-terna Bastion RDP Connector' -description 'Connects to D365 DevBox VMs through Azure Bastion' `
-    -company 'BE-terna' -product "Bastion RDP Connector - $customer" -version $Version
+    -company 'BE-terna' -product 'Bastion RDP Connector' -version $Version
 if (-not (Test-Path $output)) { throw 'PS2EXE did not create the EXE.' }
 Get-Item $output

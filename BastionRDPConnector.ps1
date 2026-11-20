@@ -7,7 +7,7 @@ Run on Windows with Windows PowerShell 5.1 or PowerShell 7 (STA).
 Select the DevBox number; it sets the VM name (vm-D365-DevBox-NN) and the
 Key Vault secret name (vm-D365-DevBox-NN-admin-password). Tenant, subscription,
 resource groups, Bastion, Key Vault, username (devboxadmin), and local port
-have defaults under "Show advanced settings".
+come from the selected customer and are shown under "Show advanced settings".
 Stopped VMs are started automatically. "Start VM" / "Stop VM..." only change
 the power state; stopping deallocates the VM after a second confirmation click.
 Missing CLI components require consent.
@@ -26,8 +26,14 @@ clipboard and other redirections follow the user's default RDP settings.
 RDP policy can still require an interactive credential prompt.
 Checks do not prove that NSG rules, guest RDP configuration, or credentials
 allow sign-in. VM startup can incur cost; the VM is not stopped on disconnect.
-To build a customer EXE, set the defaults below (including $CustomerName) and run
-Build-Exe.ps1; it writes BastionRDPConnector-<Customer>.exe via PS2EXE.
+Customers are kept in %APPDATA%\BastionRDPConnector\Customers\<Name>\settings.json
+(one folder per customer). Nothing is preconfigured: on first start, add a customer.
+"Add customer..." creates a new file from fields or pasted JSON, "Delete customer..."
+removes the selected customer's file after confirmation, "Open settings file"
+opens the selected customer's file, and saved edits load when the window is reactivated.
+"Check status" shows power state, auto-shutdown schedule, and signed-in users (quser via
+Run Command; needs Run Command permission and the VM to be running).
+Build the EXE with Build-Exe.ps1 (PS2EXE).
 #>
 #Requires -Version 5.1
 
@@ -44,23 +50,170 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$TenantId = '1a20a8f3-6bfe-4ac9-a97a-2d66b666ba45'
-$SubscriptionId = '46c6050a-3fa4-4b9c-af8e-975f5de4a736'
-$DefaultRG = 'rg_D365-DevboxShared-01'
-$DefaultBastion = 'Bas_D365-DevboxShared-01'
-$DefaultKeyVault = 'kv-D365-DevboxShared'
-$DefaultUsername = 'devboxadmin'
-$CustomerName = 'PromoCell'
-$DefaultDevBoxNumber = 3
 $VmNameFormat = 'vm-D365-DevBox-{0:D2}'
 $SecretNameFormat = '{0}-admin-password'
 $CliRoot = Join-Path $env:LOCALAPPDATA 'Programs\AzureCLI'
 $CliUrl = 'https://aka.ms/installazurecliwindowszipx64'
+$SettingsRoot = Join-Path $env:APPDATA 'BastionRDPConnector'
+$CustomersRoot = Join-Path $SettingsRoot 'Customers'
+$AppStatePath = Join-Path $SettingsRoot 'app.json'
+
+# Template for "Add customer"; also fills values that a customer file leaves out.
+# Customer-specific values are blank on purpose and must be entered per customer.
+$ProfileDefaults = [ordered]@{
+    Name = ''
+    TenantId = ''
+    SubscriptionId = ''
+    VmResourceGroup = ''
+    BastionResourceGroup = ''
+    BastionName = ''
+    KeyVaultName = ''
+    VmUsername = 'devboxadmin'
+    LocalPort = 13389
+    DevBoxNumber = 1
+    VmNameFormat = $VmNameFormat
+    SecretNameFormat = $SecretNameFormat
+}
+
+# Advanced-settings field label -> customer profile key.
+$ProfileFieldMap = [ordered]@{
+    'Tenant ID' = 'TenantId'
+    'Subscription ID' = 'SubscriptionId'
+    'VM Resource Group' = 'VmResourceGroup'
+    'Bastion Resource Group' = 'BastionResourceGroup'
+    'Bastion Name' = 'BastionName'
+    'Key Vault Name' = 'KeyVaultName'
+    'VM Username' = 'VmUsername'
+    'Local Port' = 'LocalPort'
+}
+
+function ConvertTo-CustomerProfile {
+    param($InputObject, [System.Collections.IDictionary]$Defaults)
+    $result = [ordered]@{}
+    foreach ($key in $Defaults.Keys) {
+        $value = $null
+        if ($InputObject -is [System.Collections.IDictionary]) { $value = $InputObject[$key] }
+        elseif ($null -ne $InputObject -and $InputObject.PSObject.Properties[$key]) { $value = $InputObject.$key }
+        $text = if ($null -eq $value) { '' } else { "$value".Trim() }
+        if ($key -ne 'Name' -and $text -eq '') { $text = "$($Defaults[$key])" }
+        $result[$key] = $text
+    }
+    $name = $result['Name']
+    if (-not $name -or $name -match '[\r\n]') { throw 'Every customer in the settings file needs a single-line "Name".' }
+    $number = 0
+    if (-not [int]::TryParse($result['DevBoxNumber'], [ref]$number) -or $number -lt 1 -or $number -gt 99) {
+        throw "Customer '$name': DevBoxNumber must be between 1 and 99."
+    }
+    $result['DevBoxNumber'] = $number
+    $port = 0
+    if (-not [int]::TryParse($result['LocalPort'], [ref]$port) -or $port -lt 1024 -or $port -gt 65535) {
+        throw "Customer '$name': LocalPort must be between 1024 and 65535."
+    }
+    $result['LocalPort'] = $port
+    foreach ($key in @('VmNameFormat', 'SecretNameFormat')) {
+        try { [void]($result[$key] -f 1) }
+        catch { throw "Customer '$name': $key is not a valid format string." }
+    }
+    $result
+}
+
+function Get-CustomerFolderName {
+    param([string]$Name)
+    $invalid = [regex]::Escape((-join [IO.Path]::GetInvalidFileNameChars()))
+    $folder = ($Name -replace "[$invalid]", '_').Trim(' ', '.')
+    if (-not $folder) { throw "Customer name '$Name' cannot be used as a folder name." }
+    if ($folder -match '^(CON|PRN|AUX|NUL|COM\d|LPT\d)$') { $folder += '_' }
+    $folder
+}
+
+function Write-JsonFile {
+    param([string]$Path, $InputObject)
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
+    $temp = "$Path.tmp"
+    [IO.File]::WriteAllText($temp, (ConvertTo-Json -InputObject $InputObject -Depth 5),
+        (New-Object System.Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($temp, $Path, $null) }
+    else { [IO.File]::Move($temp, $Path) }
+}
+
+function Read-CustomerProfiles {
+    param([string]$Root, [System.Collections.IDictionary]$Defaults)
+    $customers = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    if (Test-Path -LiteralPath $Root) {
+        foreach ($folder in @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object Name)) {
+            $path = Join-Path $folder.FullName 'settings.json'
+            if (-not (Test-Path -LiteralPath $path)) { continue }
+            try {
+                try { $data = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path)) -ErrorAction Stop }
+                catch { throw "not valid JSON: $($_.Exception.Message)" }
+                if ($data -isnot [System.Management.Automation.PSCustomObject]) { throw 'expected one JSON object { ... }.' }
+                if (-not "$($data.Name)".Trim()) {
+                    $data | Add-Member -NotePropertyName Name -NotePropertyValue $folder.Name -Force
+                }
+                $customer = ConvertTo-CustomerProfile $data $Defaults
+                if (@($customers | Where-Object { $_.Name -eq $customer.Name }).Count) {
+                    throw "customer name '$($customer.Name)' is already used by another folder."
+                }
+                $customer['SettingsPath'] = $path
+                [void]$customers.Add($customer)
+            }
+            catch { [void]$errors.Add("${path}: $($_.Exception.Message)") }
+        }
+    }
+    [pscustomobject]@{ Customers = $customers; Errors = $errors }
+}
+
+function New-CustomerProfileFile {
+    param([string]$Root, [System.Collections.IDictionary]$CustomerProfile, [object[]]$ExistingCustomers)
+    if (@($ExistingCustomers | Where-Object { $_.Name -eq $CustomerProfile.Name }).Count) {
+        throw "Customer '$($CustomerProfile.Name)' already exists."
+    }
+    $path = Join-Path (Join-Path $Root (Get-CustomerFolderName $CustomerProfile.Name)) 'settings.json'
+    if (Test-Path -LiteralPath $path) { throw "$path already exists." }
+    $content = [ordered]@{}
+    foreach ($key in $CustomerProfile.Keys) { if ($key -ne 'SettingsPath') { $content[$key] = $CustomerProfile[$key] } }
+    Write-JsonFile $path $content
+    $path
+}
+
+function Remove-CustomerProfileFile {
+    param([string]$Root, [System.Collections.IDictionary]$CustomerProfile)
+    if (-not $CustomerProfile.Contains('SettingsPath')) { throw "Customer '$($CustomerProfile.Name)' has no settings file." }
+    $path = [IO.Path]::GetFullPath($CustomerProfile.SettingsPath)
+    $folder = [IO.Path]::GetDirectoryName($path)
+    if ([IO.Path]::GetFileName($path) -ne 'settings.json' -or
+        [IO.Path]::GetDirectoryName($folder).TrimEnd('\') -ne [IO.Path]::GetFullPath($Root).TrimEnd('\')) {
+        throw "Refusing to delete $path; it is not a customer settings file under $Root."
+    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    # Keep the folder if the user put other files into it.
+    if (-not @(Get-ChildItem -LiteralPath $folder -Force).Count) { Remove-Item -LiteralPath $folder -Force -ErrorAction Stop }
+    $path
+}
+
+function Test-CustomerProfile {
+    param([System.Collections.IDictionary]$CustomerProfile)
+    $vmName = $CustomerProfile.VmNameFormat -f [int]$CustomerProfile.DevBoxNumber
+    [void](Get-ConnectionSettings @{
+        'Tenant ID' = "$($CustomerProfile.TenantId)"
+        'Subscription ID' = "$($CustomerProfile.SubscriptionId)"
+        'VM Resource Group' = "$($CustomerProfile.VmResourceGroup)"
+        'VM Name' = $vmName
+        'Bastion Resource Group' = "$($CustomerProfile.BastionResourceGroup)"
+        'Bastion Name' = "$($CustomerProfile.BastionName)"
+        'Key Vault Name' = "$($CustomerProfile.KeyVaultName)"
+        'Password Secret Name' = $CustomerProfile.SecretNameFormat -f $vmName
+        'VM Username' = "$($CustomerProfile.VmUsername)"
+        'Local Port' = "$($CustomerProfile.LocalPort)"
+    })
+}
 
 $form = New-Object System.Windows.Forms.Form
 $AppTitle = 'BE-terna Bastion RDP Connector'
 $AppCredits = 'Credits to BTS-Team / Christian Flock'
-$form.Text = "$AppTitle - $CustomerName"
+$form.Text = $AppTitle
 $form.Size = [System.Drawing.Size]::new(760, 520)
 $form.StartPosition = 'CenterScreen'
 $hostExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
@@ -85,15 +238,48 @@ $creditsLabel.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.F
 $creditsLabel.ForeColor = [System.Drawing.Color]::DimGray
 $form.Controls.Add($creditsLabel)
 
-$customerLabel = New-Object System.Windows.Forms.Label
-$customerLabel.Text = "Customer: $CustomerName"
-$customerLabel.Location = [System.Drawing.Point]::new(445, 14)
-$customerLabel.Size = [System.Drawing.Size]::new(270, 46)
-$customerLabel.TextAlign = 'MiddleCenter'
-$customerLabel.Font = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
-$customerLabel.BackColor = [System.Drawing.Color]::FromArgb(0, 84, 147)
-$customerLabel.ForeColor = [System.Drawing.Color]::White
-$form.Controls.Add($customerLabel)
+$customerPanel = New-Object System.Windows.Forms.Panel
+$customerPanel.Location = [System.Drawing.Point]::new(445, 14)
+$customerPanel.Size = [System.Drawing.Size]::new(270, 46)
+$customerPanel.BackColor = [System.Drawing.Color]::FromArgb(0, 84, 147)
+$form.Controls.Add($customerPanel)
+
+$customerCaption = New-Object System.Windows.Forms.Label
+$customerCaption.Text = 'Customer'
+$customerCaption.Location = [System.Drawing.Point]::new(8, 0)
+$customerCaption.Size = [System.Drawing.Size]::new(84, 46)
+$customerCaption.TextAlign = 'MiddleLeft'
+$customerCaption.Font = [System.Drawing.Font]::new('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+$customerCaption.ForeColor = [System.Drawing.Color]::White
+$customerPanel.Controls.Add($customerCaption)
+
+$customerBox = New-Object System.Windows.Forms.ComboBox
+$customerBox.DropDownStyle = 'DropDownList'
+$customerBox.Location = [System.Drawing.Point]::new(94, 8)
+$customerBox.Size = [System.Drawing.Size]::new(166, 30)
+$customerBox.Font = [System.Drawing.Font]::new('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+$customerPanel.Controls.Add($customerBox)
+
+$addCustomerLink = New-Object System.Windows.Forms.LinkLabel
+$addCustomerLink.Text = 'Add customer...'
+$addCustomerLink.Location = [System.Drawing.Point]::new(305, 152)
+$addCustomerLink.Size = [System.Drawing.Size]::new(120, 20)
+$addCustomerLink.TextAlign = 'MiddleRight'
+$form.Controls.Add($addCustomerLink)
+
+$deleteCustomerLink = New-Object System.Windows.Forms.LinkLabel
+$deleteCustomerLink.Text = 'Delete customer...'
+$deleteCustomerLink.Location = [System.Drawing.Point]::new(435, 152)
+$deleteCustomerLink.Size = [System.Drawing.Size]::new(130, 20)
+$deleteCustomerLink.TextAlign = 'MiddleRight'
+$form.Controls.Add($deleteCustomerLink)
+
+$settingsLink = New-Object System.Windows.Forms.LinkLabel
+$settingsLink.Text = 'Open settings file'
+$settingsLink.Location = [System.Drawing.Point]::new(575, 152)
+$settingsLink.Size = [System.Drawing.Size]::new(140, 20)
+$settingsLink.TextAlign = 'MiddleRight'
+$form.Controls.Add($settingsLink)
 
 $indexLabel = New-Object System.Windows.Forms.Label
 $indexLabel.Text = 'DevBox Number'
@@ -104,7 +290,7 @@ $form.Controls.Add($indexLabel)
 $devBoxNumber = New-Object System.Windows.Forms.NumericUpDown
 $devBoxNumber.Minimum = 1
 $devBoxNumber.Maximum = 99
-$devBoxNumber.Value = $DefaultDevBoxNumber
+$devBoxNumber.Value = $ProfileDefaults.DevBoxNumber
 $devBoxNumber.Location = [System.Drawing.Point]::new(135, 84)
 $devBoxNumber.Size = [System.Drawing.Size]::new(70, 24)
 $devBoxNumber.Font = [System.Drawing.Font]::new('Segoe UI', 11)
@@ -119,21 +305,27 @@ $form.AcceptButton = $btn
 
 $startVmButton = New-Object System.Windows.Forms.Button
 $startVmButton.Text = 'Start VM'
-$startVmButton.Location = [System.Drawing.Point]::new(225, 85)
-$startVmButton.Size = [System.Drawing.Size]::new(80, 26)
+$startVmButton.Location = [System.Drawing.Point]::new(215, 85)
+$startVmButton.Size = [System.Drawing.Size]::new(75, 26)
 $form.Controls.Add($startVmButton)
 
 $stopVmButton = New-Object System.Windows.Forms.Button
 $stopVmButton.Text = 'Stop VM...'
-$stopVmButton.Location = [System.Drawing.Point]::new(313, 85)
-$stopVmButton.Size = [System.Drawing.Size]::new(80, 26)
+$stopVmButton.Location = [System.Drawing.Point]::new(296, 85)
+$stopVmButton.Size = [System.Drawing.Size]::new(75, 26)
 $stopVmButton.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($stopVmButton)
 
+$statusVmButton = New-Object System.Windows.Forms.Button
+$statusVmButton.Text = 'Check status'
+$statusVmButton.Location = [System.Drawing.Point]::new(377, 85)
+$statusVmButton.Size = [System.Drawing.Size]::new(92, 26)
+$form.Controls.Add($statusVmButton)
+
 $disconnect = New-Object System.Windows.Forms.Button
 $disconnect.Text = 'Cancel'
-$disconnect.Location = [System.Drawing.Point]::new(465, 82)
-$disconnect.Size = [System.Drawing.Size]::new(120, 32)
+$disconnect.Location = [System.Drawing.Point]::new(479, 82)
+$disconnect.Size = [System.Drawing.Size]::new(106, 32)
 $disconnect.Enabled = $false
 $form.Controls.Add($disconnect)
 
@@ -151,22 +343,21 @@ $form.Controls.Add($advancedToggle)
 
 $advancedPanel = New-Object System.Windows.Forms.Panel
 $advancedPanel.Location = [System.Drawing.Point]::new(0, 178)
-$advancedPanel.Size = [System.Drawing.Size]::new(735, 378)
+$advancedPanel.Size = [System.Drawing.Size]::new(735, 344)
 $advancedPanel.Visible = $false
 $form.Controls.Add($advancedPanel)
 
 $fields = @(
-    @('Customer', $CustomerName),
-    @('Tenant ID', $TenantId),
-    @('Subscription ID', $SubscriptionId),
-    @('VM Resource Group', $DefaultRG),
+    @('Tenant ID', ''),
+    @('Subscription ID', ''),
+    @('VM Resource Group', ''),
     @('VM Name', ''),
-    @('Bastion Resource Group', $DefaultRG),
-    @('Bastion Name', $DefaultBastion),
-    @('Key Vault Name', $DefaultKeyVault),
+    @('Bastion Resource Group', ''),
+    @('Bastion Name', ''),
+    @('Key Vault Name', ''),
     @('Password Secret Name', ''),
-    @('VM Username', $DefaultUsername),
-    @('Local Port', '13389')
+    @('VM Username', $ProfileDefaults.VmUsername),
+    @('Local Port', "$($ProfileDefaults.LocalPort)")
 )
 
 $textboxes = @{}
@@ -202,12 +393,6 @@ function Update-TargetLabel {
     $targetLabel.Text = "VM: $($textboxes['VM Name'].Text)    Secret: $($textboxes['Password Secret Name'].Text)"
 }
 
-function Update-CustomerName {
-    $name = $textboxes['Customer'].Text.Trim()
-    $customerLabel.Text = "Customer: $name"
-    $form.Text = if ($name) { "$AppTitle - $name" } else { $AppTitle }
-}
-
 function Update-FormLayout {
     $top = if ($advancedToggle.Checked) { $advancedPanel.Bottom + 6 } else { 180 }
     $status.Location = [System.Drawing.Point]::new(20, $top)
@@ -216,7 +401,6 @@ function Update-FormLayout {
 }
 
 $devBoxNumber.Add_ValueChanged({ Update-TargetNames })
-$textboxes['Customer'].Add_TextChanged({ Update-CustomerName })
 $textboxes['VM Name'].Add_TextChanged({ Update-TargetLabel })
 $textboxes['Password Secret Name'].Add_TextChanged({ Update-TargetLabel })
 $advancedToggle.Add_CheckedChanged({
@@ -255,6 +439,188 @@ function Write-Log {
     $log.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Message`r`n")
     $log.ScrollToCaret()
     [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Set-ProfileToForm {
+    param([System.Collections.IDictionary]$CustomerProfile)
+    $script:VmNameFormat = $CustomerProfile.VmNameFormat
+    $script:SecretNameFormat = $CustomerProfile.SecretNameFormat
+    foreach ($label in $ProfileFieldMap.Keys) {
+        $textboxes[$label].Text = "$($CustomerProfile[$ProfileFieldMap[$label]])"
+    }
+    $devBoxNumber.Value = $CustomerProfile.DevBoxNumber
+    Update-TargetNames
+    $form.Text = "$AppTitle - $($CustomerProfile.Name)"
+}
+
+function Get-SelectedCustomer {
+    if ($customerBox.SelectedIndex -lt 0 -or $customerBox.SelectedIndex -ge @($script:Customers).Count) { return $null }
+    $script:Customers[$customerBox.SelectedIndex]
+}
+
+# Controls that need a customer stay disabled until one exists.
+function Update-CustomerControls {
+    $hasCustomer = $null -ne (Get-SelectedCustomer)
+    foreach ($textbox in $textboxes.Values) { $textbox.Enabled = $hasCustomer }
+    foreach ($control in @($devBoxNumber, $btn, $startVmButton, $stopVmButton, $statusVmButton,
+            $customerBox, $deleteCustomerLink, $settingsLink)) { $control.Enabled = $hasCustomer }
+    $addCustomerLink.Enabled = $true
+}
+
+function Update-CustomerList {
+    param([string]$Select)
+    $script:UpdatingCustomers = $true
+    try {
+        $customerBox.Items.Clear()
+        foreach ($customer in $script:Customers) { [void]$customerBox.Items.Add($customer.Name) }
+        if ($customerBox.Items.Count) {
+            $customerBox.SelectedIndex = [Math]::Max(0, $customerBox.FindStringExact($Select))
+        }
+    }
+    finally { $script:UpdatingCustomers = $false }
+    $customer = Get-SelectedCustomer
+    if ($customer) { Set-ProfileToForm $customer }
+    else {
+        foreach ($label in $ProfileFieldMap.Keys) { $textboxes[$label].Text = "$($ProfileDefaults[$ProfileFieldMap[$label]])" }
+        $form.Text = "$AppTitle - no customer"
+    }
+    Update-CustomerControls
+}
+
+function Get-SettingsStamp {
+    if (-not (Test-Path -LiteralPath $CustomersRoot)) { return '' }
+    @(Get-ChildItem -LiteralPath $CustomersRoot -Directory | ForEach-Object {
+        $file = Join-Path $_.FullName 'settings.json'
+        if (Test-Path -LiteralPath $file) { "$file|$((Get-Item -LiteralPath $file).LastWriteTimeUtc.Ticks)" }
+    }) -join ';'
+}
+
+function Save-CustomerSelection {
+    try { Write-JsonFile $AppStatePath ([ordered]@{ SelectedCustomer = "$($customerBox.SelectedItem)" }) }
+    catch { Write-Log "Could not remember the selected customer: $($_.Exception.Message)" ([System.Drawing.Color]::Orange) }
+}
+
+function Import-CustomerProfiles {
+    param([string]$Select, [switch]$Reload)
+    if (-not $Select -and $customerBox.SelectedItem) { $Select = "$($customerBox.SelectedItem)" }
+    if (-not $Select -and (Test-Path -LiteralPath $AppStatePath)) {
+        try { $Select = "$((ConvertFrom-Json ([IO.File]::ReadAllText($AppStatePath))).SelectedCustomer)" } catch { }
+    }
+    try {
+        $loaded = Read-CustomerProfiles $CustomersRoot $ProfileDefaults
+        foreach ($problem in $loaded.Errors) {
+            Write-Log "Skipped customer settings $problem" ([System.Drawing.Color]::Orange)
+        }
+        $script:Customers = @($loaded.Customers)
+        if ($Reload) { Write-Log 'Customer settings changed on disk; reloaded.' }
+    }
+    catch {
+        Write-Log "Could not load customer settings: $($_.Exception.Message)" ([System.Drawing.Color]::Tomato)
+    }
+    if (-not $script:Customers) { $script:Customers = @() }
+    $script:SettingsStamp = Get-SettingsStamp
+    Update-CustomerList $Select
+    if (-not $script:Customers.Count) {
+        Write-Log "No customer configured yet. Click 'Add customer...' to create one (settings folder: $CustomersRoot)." ([System.Drawing.Color]::Gold)
+    }
+}
+
+function Show-AddCustomerDialog {
+    param([System.Collections.IDictionary]$Template)
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'Add customer'
+    $dialog.ClientSize = [System.Drawing.Size]::new(540, 520)
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.Font = $form.Font
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Location = [System.Drawing.Point]::new(12, 12)
+    $tabs.Size = [System.Drawing.Size]::new(516, 450)
+    $dialog.Controls.Add($tabs)
+    $fieldTab = New-Object System.Windows.Forms.TabPage 'Fill in fields'
+    $jsonTab = New-Object System.Windows.Forms.TabPage 'Paste JSON'
+    $tabs.TabPages.AddRange(@($fieldTab, $jsonTab))
+
+    $templateValues = [ordered]@{}
+    foreach ($key in $Template.Keys) { if ($key -ne 'SettingsPath') { $templateValues[$key] = $Template[$key] } }
+    $templateValues['Name'] = ''
+    $inputs = [ordered]@{}
+    $y = 12
+    foreach ($key in $templateValues.Keys) {
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $key
+        $label.Location = [System.Drawing.Point]::new(10, ($y + 4))
+        $label.Size = [System.Drawing.Size]::new(150, 22)
+        $fieldTab.Controls.Add($label)
+        $input = New-Object System.Windows.Forms.TextBox
+        $input.Text = "$($templateValues[$key])"
+        $input.Location = [System.Drawing.Point]::new(165, $y)
+        $input.Size = [System.Drawing.Size]::new(325, 24)
+        $fieldTab.Controls.Add($input)
+        $inputs[$key] = $input
+        $y += 33
+    }
+
+    $jsonHint = New-Object System.Windows.Forms.Label
+    $jsonHint.Text = 'Paste one JSON object. Values you leave out use the built-in defaults.'
+    $jsonHint.Location = [System.Drawing.Point]::new(10, 10)
+    $jsonHint.Size = [System.Drawing.Size]::new(480, 20)
+    $jsonTab.Controls.Add($jsonHint)
+    $jsonBox = New-Object System.Windows.Forms.TextBox
+    $jsonBox.Multiline = $true
+    $jsonBox.AcceptsReturn = $true
+    $jsonBox.ScrollBars = 'Both'
+    $jsonBox.WordWrap = $false
+    $jsonBox.Font = [System.Drawing.Font]::new('Consolas', 9)
+    $jsonBox.Location = [System.Drawing.Point]::new(10, 34)
+    $jsonBox.Size = [System.Drawing.Size]::new(485, 375)
+    $jsonBox.Text = (ConvertTo-Json -InputObject $templateValues) -replace "`r?`n", "`r`n"
+    $jsonTab.Controls.Add($jsonBox)
+
+    $create = New-Object System.Windows.Forms.Button
+    $create.Text = 'Create customer'
+    $create.Location = [System.Drawing.Point]::new(298, 476)
+    $create.Size = [System.Drawing.Size]::new(120, 32)
+    $dialog.Controls.Add($create)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.DialogResult = 'Cancel'
+    $cancel.Location = [System.Drawing.Point]::new(428, 476)
+    $cancel.Size = [System.Drawing.Size]::new(100, 32)
+    $dialog.Controls.Add($cancel)
+    $dialog.CancelButton = $cancel
+
+    $result = @{}
+    $create.Add_Click({
+        try {
+            if ($tabs.SelectedTab -eq $jsonTab) {
+                try { $source = ConvertFrom-Json -InputObject $jsonBox.Text -ErrorAction Stop }
+                catch { throw "The JSON is not valid: $($_.Exception.Message)" }
+                if ($source -isnot [System.Management.Automation.PSCustomObject]) { throw 'Paste one JSON object { ... }.' }
+            }
+            else {
+                $source = @{}
+                foreach ($key in $inputs.Keys) { $source[$key] = $inputs[$key].Text }
+            }
+            $candidate = ConvertTo-CustomerProfile $source $ProfileDefaults
+            Test-CustomerProfile $candidate
+            $result.Path = New-CustomerProfileFile $CustomersRoot $candidate $script:Customers
+            $script:SettingsStamp = Get-SettingsStamp
+            $result.Name = $candidate.Name
+            $dialog.DialogResult = 'OK'
+        }
+        catch {
+            [void][System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, 'Add customer',
+                'OK', 'Warning')
+        }
+    })
+    try {
+        if ($dialog.ShowDialog($form) -eq 'OK') { return [pscustomobject]$result }
+    }
+    finally { $dialog.Dispose() }
 }
 
 function Find-AzCommand {
@@ -656,12 +1022,131 @@ function Initialize-AzureSession {
     Write-Log "Authenticated to subscription $($account.name)."
 }
 
+function Get-AutoShutdownSchedule {
+    param($Settings)
+    $id = "/subscriptions/$($Settings.SubscriptionId)/resourceGroups/$($Settings.VmResourceGroup)" +
+        "/providers/Microsoft.DevTestLab/schedules/shutdown-computevm-$($Settings.VmName)"
+    $result = Invoke-AzRaw @('resource', 'show', '--ids', $id, '--only-show-errors', '--output', 'json')
+    if ($result.ExitCode -ne 0) {
+        if ($result.Output -match 'ResourceNotFound|NotFound|was not found|could not be found') { return $null }
+        throw "Could not read the auto-shutdown schedule: $($result.Output)"
+    }
+    ConvertFrom-Json -InputObject $result.Output
+}
+
+function Format-AutoShutdown {
+    param($Schedule, [DateTime]$UtcNow = [DateTime]::UtcNow)
+    if (-not $Schedule) { return 'not configured' }
+    $properties = $Schedule.properties
+    $time = "$($properties.dailyRecurrence.time)"
+    if ($time -notmatch '^(\d{2}):?(\d{2})$') { return "$($properties.status), time '$time' ($($properties.timeZoneId))" }
+    $hours = [int]$Matches[1]
+    $minutes = [int]$Matches[2]
+    $text = "$($properties.status), daily at {0:D2}:{1:D2} ($($properties.timeZoneId))" -f $hours, $minutes
+    if ($properties.status -eq 'Enabled') {
+        try {
+            $zone = [TimeZoneInfo]::FindSystemTimeZoneById($properties.timeZoneId)
+            $now = [TimeZoneInfo]::ConvertTimeFromUtc($UtcNow, $zone)
+            $next = $now.Date.AddHours($hours).AddMinutes($minutes)
+            if ($next -le $now) { $next = $next.AddDays(1) }
+            $left = $next - $now
+            $text += " - next shutdown in $([int][Math]::Floor($left.TotalHours))h $($left.Minutes)m"
+        }
+        catch { }
+    }
+    if ($properties.notificationSettings.status -eq 'Enabled') {
+        $text += ", notification $($properties.notificationSettings.timeInMinutes) min before"
+    }
+    $text
+}
+
+function ConvertFrom-QuserOutput {
+    param([string]$Text)
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^\s*>?(?<user>\S+)\s+(?:(?<session>\S+)\s+)?(?<id>\d+)\s+(?<state>\S+)\s+(?<idle>\S+)\s+(?<logon>\S.*?)\s*$') {
+            [pscustomobject]@{
+                User = $Matches.user
+                State = $Matches.state
+                Idle = if ($Matches.idle -in @('.', 'none', 'Kein', 'Keine')) { 'none' } else { $Matches.idle }
+                LogonTime = $Matches.logon
+            }
+        }
+    }
+}
+
+function Get-VmSignedInUsers {
+    param($Settings)
+    $message = Invoke-Az @('vm', 'run-command', 'invoke', '--resource-group', $Settings.VmResourceGroup,
+        '--name', $Settings.VmName, '--subscription', $Settings.SubscriptionId,
+        '--command-id', 'RunPowerShellScript', '--scripts', 'quser', '--query', 'value[0].message')
+    @(ConvertFrom-QuserOutput "$message")
+}
+
+function Invoke-VmStatusCheck {
+    $script:CancelRequested = $false
+    Set-UiBusy $true
+    try {
+        $settings = Get-FormSettings
+        Write-Log "Status check for $($settings.VmName)." ([System.Drawing.Color]::LightGreen)
+        Initialize-AzureSession $settings
+        $status.Text = 'Checking VM...'
+        $vm = Invoke-Az (Get-VmInstanceArgs $settings)
+        $state = (Get-VmPowerState $vm) -replace '^PowerState/', ''
+        $running = $state -eq 'running'
+        $stateColor = if ($running) { [System.Drawing.Color]::LightGreen } else { [System.Drawing.Color]::Gold }
+        Write-Log "Power state: $state" $stateColor
+
+        Assert-NotCancelled
+        $status.Text = 'Reading auto-shutdown...'
+        try { Write-Log "Auto-shutdown: $(Format-AutoShutdown (Get-AutoShutdownSchedule $settings))" }
+        catch { Write-Log $_.Exception.Message ([System.Drawing.Color]::Orange) }
+
+        Assert-NotCancelled
+        if ($running) {
+            $status.Text = 'Checking signed-in users (can take up to 1 minute)...'
+            Write-Log 'Checking signed-in users on the VM (Run Command, can take up to 1 minute)...'
+            try {
+                $users = Get-VmSignedInUsers $settings
+                if (-not $users.Count) {
+                    Write-Log 'Nobody is signed in to the VM.' ([System.Drawing.Color]::LightGreen)
+                }
+                foreach ($user in $users) {
+                    $userColor = if ($user.State -match '^(Active|Aktiv)') { [System.Drawing.Color]::Gold } else { [System.Drawing.Color]::Gainsboro }
+                    Write-Log "Signed in: $($user.User) - $($user.State), idle $($user.Idle), since $($user.LogonTime)" $userColor
+                }
+                if (@($users | Where-Object { $_.State -match '^(Active|Aktiv)' }).Count) {
+                    Write-Log 'Someone has an active session on this VM - check before stopping it.' ([System.Drawing.Color]::Gold)
+                }
+                elseif ($users.Count) {
+                    Write-Log 'Only disconnected sessions - unsaved work may still be open.' ([System.Drawing.Color]::Gold)
+                }
+            }
+            catch {
+                Write-Log "Could not check signed-in users (needs Run Command permission on the VM): $($_.Exception.Message)" ([System.Drawing.Color]::Orange)
+            }
+        }
+        else { Write-Log 'Nobody can be signed in while the VM is not running.' }
+        $status.Text = 'Ready'
+    }
+    catch [OperationCanceledException] {
+        $status.Text = 'Ready'
+        Write-Log 'Status check cancelled.' ([System.Drawing.Color]::Gold)
+    }
+    catch {
+        $status.Text = 'Error'
+        Write-Log $_.Exception.Message ([System.Drawing.Color]::Salmon)
+    }
+    finally { Set-UiBusy $false }
+}
+
 function Set-UiBusy {
     param([bool]$Busy, [string]$CancelText = 'Cancel')
     foreach ($textbox in $textboxes.Values) { $textbox.Enabled = -not $Busy }
-    foreach ($control in @($devBoxNumber, $btn, $startVmButton, $stopVmButton)) { $control.Enabled = -not $Busy }
+    foreach ($control in @($devBoxNumber, $btn, $startVmButton, $stopVmButton, $statusVmButton,
+            $customerBox, $addCustomerLink, $deleteCustomerLink, $settingsLink)) { $control.Enabled = -not $Busy }
     $disconnect.Enabled = $Busy
     $disconnect.Text = if ($Busy) { $CancelText } else { 'Cancel' }
+    if (-not $Busy) { Update-CustomerControls }
 }
 
 function Get-FormSettings {
@@ -1048,6 +1533,69 @@ $btn.Add_Click({
 
 $startVmButton.Add_Click({ Invoke-VmPowerOperation -Operation 'Start' })
 $stopVmButton.Add_Click({ Invoke-VmPowerOperation -Operation 'Stop' })
+$statusVmButton.Add_Click({ Invoke-VmStatusCheck })
+
+$customerBox.Add_SelectedIndexChanged({
+    if ($script:UpdatingCustomers) { return }
+    $customer = Get-SelectedCustomer
+    if (-not $customer) { return }
+    Set-ProfileToForm $customer
+    Save-CustomerSelection
+    Write-Log "Customer: $($customerBox.SelectedItem)"
+})
+function Invoke-AddCustomer {
+    $template = Get-SelectedCustomer
+    if (-not $template) { $template = $ProfileDefaults }
+    $created = Show-AddCustomerDialog $template
+    if ($created) {
+        Write-Log "Created customer '$($created.Name)': $($created.Path)" ([System.Drawing.Color]::LightGreen)
+        Import-CustomerProfiles -Select $created.Name
+        Save-CustomerSelection
+    }
+}
+$addCustomerLink.Add_LinkClicked({ Invoke-AddCustomer })
+$deleteCustomerLink.Add_LinkClicked({
+    $customer = Get-SelectedCustomer
+    if (-not $customer) { return }
+    if (-not $customer.Contains('SettingsPath')) {
+        Write-Log 'This customer has no settings file to delete.' ([System.Drawing.Color]::Orange)
+        return
+    }
+    $answer = [System.Windows.Forms.MessageBox]::Show($form,
+        "Delete customer '$($customer.Name)'?`r`n`r`nThis permanently deletes:`r`n$($customer.SettingsPath)`r`n`r`nAzure resources are not affected.",
+        'Delete customer', 'YesNo', 'Warning', 'Button2')
+    if ($answer -ne 'Yes') { return }
+    try {
+        $removed = Remove-CustomerProfileFile $CustomersRoot $customer
+        Write-Log "Deleted customer '$($customer.Name)': $removed" ([System.Drawing.Color]::LightGreen)
+    }
+    catch {
+        Write-Log "Could not delete customer '$($customer.Name)': $($_.Exception.Message)" ([System.Drawing.Color]::Tomato)
+        return
+    }
+    Import-CustomerProfiles
+    Save-CustomerSelection
+})
+$settingsLink.Add_LinkClicked({
+    $customer = Get-SelectedCustomer
+    if (-not $customer) { return }
+    if (-not $customer.Contains('SettingsPath')) {
+        Write-Log 'This customer has no settings file (the settings folder could not be written).' ([System.Drawing.Color]::Orange)
+        return
+    }
+    try { Start-Process -FilePath $customer.SettingsPath -ErrorAction Stop }
+    catch { Start-Process -FilePath "$env:SystemRoot\System32\notepad.exe" -ArgumentList "`"$($customer.SettingsPath)`"" }
+    Write-Log "Opened $($customer.SettingsPath). Saved changes are loaded when you return to this window."
+})
+# The add link is only disabled while an operation runs, so it doubles as the "not busy" flag.
+$form.Add_Activated({
+    if ($addCustomerLink.Enabled -and (Get-SettingsStamp) -ne $script:SettingsStamp) {
+        $script:SettingsStamp = Get-SettingsStamp
+        Import-CustomerProfiles -Reload
+    }
+})
+$form.Add_Shown({ if (-not $script:Customers.Count) { Invoke-AddCustomer } })
+Import-CustomerProfiles
 
 try { [void]$form.ShowDialog() }
 finally { $form.Dispose() }

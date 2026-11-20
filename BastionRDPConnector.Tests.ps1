@@ -374,6 +374,87 @@ Describe 'Detached connection helper' {
     }
 }
 
+Describe 'Customer settings files' {
+    BeforeEach {
+        $defaults = [ordered]@{
+            Name = 'Default'; TenantId = '11111111-1111-1111-1111-111111111111'
+            SubscriptionId = '22222222-2222-2222-2222-222222222222'; VmResourceGroup = 'rg-vm'
+            BastionResourceGroup = 'rg-vm'; BastionName = 'bas-test'; KeyVaultName = 'kv-test'
+            VmUsername = 'devboxadmin'; LocalPort = 13389; DevBoxNumber = 3
+            VmNameFormat = 'vm-DevBox-{0:D2}'; SecretNameFormat = '{0}-admin-password'
+        }
+        $root = Join-Path $TestDrive ([guid]::NewGuid())
+    }
+
+    It 'creates one folder per customer and reads it back with defaults for omitted values' {
+        $customer = ConvertTo-CustomerProfile ([pscustomobject]@{ Name = 'Contoso: EU'; BastionName = 'bas-contoso' }) $defaults
+        $path = New-CustomerProfileFile $root $customer @()
+        $path | Should Be (Join-Path $root 'Contoso_ EU\settings.json')
+        $loaded = Read-CustomerProfiles $root $defaults
+        $loaded.Errors.Count | Should Be 0
+        $loaded.Customers[0].Name | Should Be 'Contoso: EU'
+        $loaded.Customers[0].BastionName | Should Be 'bas-contoso'
+        $loaded.Customers[0].DevBoxNumber | Should Be 3
+        $loaded.Customers[0].SettingsPath | Should Be $path
+        { New-CustomerProfileFile $root $customer $loaded.Customers } | Should Throw 'already exists'
+    }
+
+    It 'skips a broken customer file but still loads the others' {
+        New-CustomerProfileFile $root (ConvertTo-CustomerProfile @{ Name = 'Good' } $defaults) @() | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $root 'Broken') | Out-Null
+        Set-Content -Path (Join-Path $root 'Broken\settings.json') -Value '{ "Name": '
+        $loaded = Read-CustomerProfiles $root $defaults
+        @($loaded.Customers).Count | Should Be 1
+        $loaded.Errors[0] | Should Match 'Broken.*not valid JSON'
+    }
+
+    It 'deletes a customer file, removing the folder only when it is empty' {
+        New-CustomerProfileFile $root (ConvertTo-CustomerProfile @{ Name = 'Gone' } $defaults) @() | Out-Null
+        New-CustomerProfileFile $root (ConvertTo-CustomerProfile @{ Name = 'Notes' } $defaults) @() | Out-Null
+        Set-Content -Path (Join-Path $root 'Notes\readme.txt') -Value 'keep me'
+        $loaded = Read-CustomerProfiles $root $defaults
+        foreach ($customer in $loaded.Customers) { Remove-CustomerProfileFile $root $customer | Out-Null }
+        Test-Path (Join-Path $root 'Gone') | Should Be $false
+        Test-Path (Join-Path $root 'Notes\settings.json') | Should Be $false
+        Test-Path (Join-Path $root 'Notes\readme.txt') | Should Be $true
+        @((Read-CustomerProfiles $root $defaults).Customers).Count | Should Be 0
+        $outside = ConvertTo-CustomerProfile @{ Name = 'X' } $defaults
+        $outside['SettingsPath'] = Join-Path $TestDrive 'settings.json'
+        { Remove-CustomerProfileFile $root $outside } | Should Throw 'Refusing'
+    }
+
+    It 'rejects invalid ports and format strings' {
+        { ConvertTo-CustomerProfile @{ Name = 'X'; LocalPort = '80' } $defaults } | Should Throw 'LocalPort'
+        { ConvertTo-CustomerProfile @{ Name = 'X'; VmNameFormat = 'vm-{0' } $defaults } | Should Throw 'VmNameFormat'
+        { ConvertTo-CustomerProfile @{ BastionName = 'b' } $defaults } | Should Throw 'Name'
+    }
+}
+
+Describe 'VM status details' {
+    It 'parses active and disconnected quser sessions from Run Command output' {
+        $text = "Enable succeeded: `n[stdout]`n USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME`n" +
+            " devboxadmin           rdp-tcp#0           2  Active          .  20.11.2026 15:02`n" +
+            " otheruser                                 3  Disc         1:05  20.11.2026 09:12`n[stderr]`n"
+        $users = @(ConvertFrom-QuserOutput $text)
+        $users.Count | Should Be 2
+        $users[0].User | Should Be 'devboxadmin'
+        $users[0].State | Should Be 'Active'
+        $users[0].Idle | Should Be 'none'
+        $users[1].State | Should Be 'Disc'
+        $users[1].LogonTime | Should Be '20.11.2026 09:12'
+        @(ConvertFrom-QuserOutput "[stderr]`nNo User exists for *").Count | Should Be 0
+    }
+
+    It 'formats the auto-shutdown schedule with the time until the next shutdown' {
+        $schedule = [pscustomobject]@{ properties = [pscustomobject]@{
+            status = 'Enabled'; timeZoneId = 'UTC'; dailyRecurrence = [pscustomobject]@{ time = '1900' }
+            notificationSettings = [pscustomobject]@{ status = 'Disabled' } } }
+        Format-AutoShutdown $schedule ([DateTime]::new(2026, 11, 20, 16, 30, 0, [DateTimeKind]::Utc)) |
+            Should Be 'Enabled, daily at 19:00 (UTC) - next shutdown in 2h 30m'
+        Format-AutoShutdown $null | Should Be 'not configured'
+    }
+}
+
 Describe 'Azure CLI discovery' {
     It 'returns one az.cmd path when PATH also contains the extensionless az script' {
         $bin = Join-Path $TestDrive 'wbin'
