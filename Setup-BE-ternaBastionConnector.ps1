@@ -3,10 +3,11 @@
 Installs BE-ternaBastionConnector for the current user (no admin rights needed).
 .DESCRIPTION
 - Creates %APPDATA%\BE-ternaBastionConnector (app files) with a Customers subfolder (settings).
-- Copies BE-ternaBastionConnector.ps1 and the icon from this folder into it.
 - Moves customers from the old %APPDATA%\BastionRDPConnector folder, if present.
 - Installs Azure CLI for the current user if missing and adds the Bastion extension.
-- Creates Desktop and Start Menu shortcuts.
+- Creates Desktop and Start Menu shortcuts to %APPDATA%\BE-ternaBastionConnector\BE-ternaBastionConnector.ps1.
+- Opens the folder at the end: copy BE-ternaBastionConnector.ps1 (and the .ico) into it manually.
+  Run setup again after copying the .ico to show it on the shortcuts.
 Run again to update; customers are kept.
 Run with: powershell -NoProfile -ExecutionPolicy Bypass -File .\Setup-BE-ternaBastionConnector.ps1
 Remove with: ... -File .\Setup-BE-ternaBastionConnector.ps1 -Uninstall
@@ -20,18 +21,52 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$AppName = 'BE-ternaBastionConnector'
-$InstallRoot = Join-Path $env:APPDATA 'BE-ternaBastionConnector'
-$LegacyRoot = Join-Path $env:APPDATA 'BastionRDPConnector'
-$CliRoot = Join-Path $env:LOCALAPPDATA 'Programs\AzureCLI'
-$CliUrl = 'https://aka.ms/installazurecliwindowszipx64'
-$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$Shortcuts = @(
-    (Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName.lnk"),
-    (Join-Path ([Environment]::GetFolderPath('Programs')) "$AppName.lnk")
-)
+function Wait-BeforeClose {
+    try { Read-Host "`nPress Enter to close this window" | Out-Null }
+    catch { }
+}
 
 function Write-Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
+
+try {
+$AppName = 'BE-ternaBastionConnector'
+$AppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+if ([string]::IsNullOrWhiteSpace($AppDataRoot)) { $AppDataRoot = $env:APPDATA }
+if ([string]::IsNullOrWhiteSpace($AppDataRoot) -and $env:USERPROFILE) {
+    $AppDataRoot = Join-Path $env:USERPROFILE 'AppData\Roaming'
+}
+if ([string]::IsNullOrWhiteSpace($AppDataRoot)) { throw 'Could not determine the current user AppData folder.' }
+
+$LocalAppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($LocalAppDataRoot)) { $LocalAppDataRoot = $env:LOCALAPPDATA }
+if ([string]::IsNullOrWhiteSpace($LocalAppDataRoot) -and $env:USERPROFILE) {
+    $LocalAppDataRoot = Join-Path $env:USERPROFILE 'AppData\Local'
+}
+if ([string]::IsNullOrWhiteSpace($LocalAppDataRoot)) { throw 'Could not determine the current user Local AppData folder.' }
+
+$InstallRoot = Join-Path $AppDataRoot 'BE-ternaBastionConnector'
+$LegacyRoot = Join-Path $AppDataRoot 'BastionRDPConnector'
+$CliRoot = Join-Path $LocalAppDataRoot 'Programs\AzureCLI'
+$CliUrl = 'https://aka.ms/installazurecliwindowszipx64'
+$WindowsRoot = $env:SystemRoot
+if ([string]::IsNullOrWhiteSpace($WindowsRoot)) { $WindowsRoot = $env:windir }
+if ([string]::IsNullOrWhiteSpace($WindowsRoot)) { throw 'Could not determine the Windows folder.' }
+$PowerShellExe = Join-Path $WindowsRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+$DesktopRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+if ([string]::IsNullOrWhiteSpace($DesktopRoot) -and $env:USERPROFILE) {
+    $DesktopRoot = Join-Path $env:USERPROFILE 'Desktop'
+}
+$ProgramsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)
+if ([string]::IsNullOrWhiteSpace($ProgramsRoot)) {
+    $ProgramsRoot = Join-Path $AppDataRoot 'Microsoft\Windows\Start Menu\Programs'
+}
+if ([string]::IsNullOrWhiteSpace($DesktopRoot)) { throw 'Could not determine the current user Desktop folder.' }
+
+$Shortcuts = @(
+    (Join-Path $DesktopRoot "$AppName.lnk"),
+    (Join-Path $ProgramsRoot "$AppName.lnk")
+)
 
 if ($Uninstall) {
     foreach ($path in $Shortcuts) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force } }
@@ -41,11 +76,7 @@ if ($Uninstall) {
     }
     Write-Host "Removed shortcuts and app files. Customer settings were kept in $InstallRoot." -ForegroundColor Green
     Write-Host 'Azure CLI was not removed.'
-    return
-}
-
-$source = Join-Path $PSScriptRoot 'BE-ternaBastionConnector.ps1'
-if (-not (Test-Path -LiteralPath $source)) { throw "BE-ternaBastionConnector.ps1 was not found next to the setup script ($PSScriptRoot)." }
+} else {
 
 Write-Step "Creating $InstallRoot"
 $customersRoot = Join-Path $InstallRoot 'Customers'
@@ -60,17 +91,9 @@ if ((Test-Path -LiteralPath $legacyCustomers) -and -not @(Get-ChildItem -Literal
     Remove-Item -LiteralPath $LegacyRoot -Recurse -Force
 }
 
-Write-Step 'Copying app files'
 $target = Join-Path $InstallRoot 'BE-ternaBastionConnector.ps1'
-Copy-Item -LiteralPath $source -Destination $target -Force
-$icon = $null
-$iconSource = Join-Path $PSScriptRoot 'BE-ternaBastionConnector.ico'
-if (Test-Path -LiteralPath $iconSource) {
-    $icon = Join-Path $InstallRoot 'BE-ternaBastionConnector.ico'
-    Copy-Item -LiteralPath $iconSource -Destination $icon -Force
-}
-# Files from downloads or Teams carry a Mark of the Web that blocks execution.
-Get-ChildItem -LiteralPath $InstallRoot -File | Unblock-File
+$icon = Join-Path $InstallRoot 'BE-ternaBastionConnector.ico'
+if (-not (Test-Path -LiteralPath $icon)) { $icon = $null }
 
 if (-not $SkipAzureCli) {
     Write-Step 'Checking Azure CLI'
@@ -80,7 +103,9 @@ if (-not $SkipAzureCli) {
     }
     if (-not $az) {
         Write-Step "Installing Azure CLI to $CliRoot (download about 100 MB)"
-        $zip = Join-Path $env:TEMP ("AzureCLI-$([guid]::NewGuid()).zip")
+        $tempRoot = [IO.Path]::GetTempPath()
+        if ([string]::IsNullOrWhiteSpace($tempRoot)) { throw 'Could not determine a temporary folder for the Azure CLI download.' }
+        $zip = Join-Path $tempRoot ("AzureCLI-$([guid]::NewGuid()).zip")
         New-Item -ItemType Directory -Force -Path $CliRoot | Out-Null
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -119,4 +144,15 @@ foreach ($path in $Shortcuts) {
     Write-Host "    $path"
 }
 
-Write-Host "`n$AppName installed to $InstallRoot. Start it from the Desktop shortcut." -ForegroundColor Green
+Write-Host "`nSetup finished. Copy BE-ternaBastionConnector.ps1 (and BE-ternaBastionConnector.ico) into the opened folder:" -ForegroundColor Green
+Write-Host "    $InstallRoot" -ForegroundColor Green
+Write-Host 'Then start it from the Desktop shortcut.' -ForegroundColor Green
+Start-Process -FilePath (Join-Path $WindowsRoot 'explorer.exe') -ArgumentList "`"$InstallRoot`""
+}
+}
+catch {
+    Write-Host "`nSetup failed: $($_.Exception.Message)" -ForegroundColor Red
+}
+finally {
+    Wait-BeforeClose
+}
