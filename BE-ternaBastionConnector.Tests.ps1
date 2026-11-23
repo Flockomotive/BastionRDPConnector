@@ -1,9 +1,9 @@
-﻿# Run with: Invoke-Pester .\BastionRDPConnector.Tests.ps1
+# Run with: Invoke-Pester .\BE-ternaBastionConnector.Tests.ps1
 # Only function definitions are loaded: no GUI, Azure login, or real secrets.
 $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    (Join-Path $PSScriptRoot 'BastionRDPConnector.ps1'), [ref]$tokens, [ref]$parseErrors)
+    (Join-Path $PSScriptRoot 'BE-ternaBastionConnector.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors.Message -join "`n") }
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security

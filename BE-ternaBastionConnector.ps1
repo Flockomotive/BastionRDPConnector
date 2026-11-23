@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-BE-terna Bastion RDP Connector - connects to a D365 DevBox VM through Azure Bastion.
+BE-ternaBastionConnector - connects to a D365 DevBox VM through Azure Bastion.
 Credits to BTS-Team / Christian Flock.
 .DESCRIPTION
 Run on Windows with Windows PowerShell 5.1 or PowerShell 7 (STA).
@@ -26,14 +26,15 @@ clipboard and other redirections follow the user's default RDP settings.
 RDP policy can still require an interactive credential prompt.
 Checks do not prove that NSG rules, guest RDP configuration, or credentials
 allow sign-in. VM startup can incur cost; the VM is not stopped on disconnect.
-Customers are kept in %APPDATA%\BastionRDPConnector\Customers\<Name>\settings.json
+Customers are kept in %APPDATA%\BE-ternaBastionConnector\Customers\<Name>\settings.json
 (one folder per customer). Nothing is preconfigured: on first start, add a customer.
 "Add customer..." creates a new file from fields or pasted JSON, "Delete customer..."
 removes the selected customer's file after confirmation, "Open settings file"
 opens the selected customer's file, and saved edits load when the window is reactivated.
 "Check status" shows power state, auto-shutdown schedule, and signed-in users (quser via
 Run Command; needs Run Command permission and the VM to be running).
-Build the EXE with Build-Exe.ps1 (PS2EXE).
+Install with Setup-BE-ternaBastionConnector.ps1. It installs the script and Azure CLI
+for the current user, and creates Desktop and Start Menu shortcuts.
 #>
 #Requires -Version 5.1
 
@@ -54,7 +55,7 @@ $VmNameFormat = 'vm-D365-DevBox-{0:D2}'
 $SecretNameFormat = '{0}-admin-password'
 $CliRoot = Join-Path $env:LOCALAPPDATA 'Programs\AzureCLI'
 $CliUrl = 'https://aka.ms/installazurecliwindowszipx64'
-$SettingsRoot = Join-Path $env:APPDATA 'BastionRDPConnector'
+$SettingsRoot = Join-Path $env:APPDATA 'BE-ternaBastionConnector'
 $CustomersRoot = Join-Path $SettingsRoot 'Customers'
 $AppStatePath = Join-Path $SettingsRoot 'app.json'
 
@@ -211,7 +212,7 @@ function Test-CustomerProfile {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$AppTitle = 'BE-terna Bastion RDP Connector'
+$AppTitle = 'BE-ternaBastionConnector'
 $AppCredits = 'Credits to BTS-Team / Christian Flock'
 $form.Text = $AppTitle
 $form.Size = [System.Drawing.Size]::new(760, 520)
